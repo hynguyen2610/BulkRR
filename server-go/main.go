@@ -45,6 +45,8 @@ type FileWatcherService struct {
 	intervalMsProcessFiles time.Duration
 	folderPath             string
 	mu                     sync.Mutex
+	newFilesEvent          chan string // Channel to notify new files
+	processFilesEvent      chan bool   // Channel to trigger file processing
 }
 
 // NewFileWatcherService creates a new FileWatcherService instance.
@@ -58,7 +60,22 @@ func NewFileWatcherService(folderPath string, maxThreads int, intervalMsCheckFil
 		filesQueue:             []string{},
 		lock:                   make(map[string]FileLock),
 		currentFileIndex:       0,
+		newFilesEvent:          make(chan string, 10), // Buffered channel
+		processFilesEvent:      make(chan bool),       // Simple event channel
 	}
+}
+func (s *FileWatcherService) handleNewFileEvent(file string) {
+	// Check if the file is already tracked and processing
+	if s.isFileTracked(file) {
+		// If file is already being processed or completed, just log and return
+		fmt.Printf("File %s is already being processed or completed\n", file)
+		return
+	}
+
+	// Otherwise, trigger processing of the file
+	fmt.Printf("Processing new file: %s\n", file)
+	// Trigger file processing, which will start the worker
+	s.processFiles()
 }
 
 // StartWatching starts the service to watch the directory and process files.
@@ -68,19 +85,29 @@ func (s *FileWatcherService) StartWatching() {
 	}
 	s.watching = true
 
-	// Start checking for new files periodically
+	// Event loop for new file detection
 	go func() {
 		for {
-			s.checkForNewFiles()
-			time.Sleep(s.intervalMsCheckFiles)
+			select {
+			case <-time.After(s.intervalMsCheckFiles):
+				s.checkForNewFiles()
+			case newFile := <-s.newFilesEvent:
+				// Process the new file event
+				s.handleNewFileEvent(newFile)
+			}
 		}
 	}()
 
-	// Start processing files periodically
+	// Event loop for processing files
 	go func() {
 		for {
-			s.processFiles()
-			time.Sleep(s.intervalMsProcessFiles)
+			select {
+			case <-time.After(s.intervalMsProcessFiles):
+				s.processFiles()
+			case <-s.processFilesEvent:
+				// Trigger manual file processing event
+				s.processFiles()
+			}
 		}
 	}()
 }
@@ -101,6 +128,7 @@ func (s *FileWatcherService) checkForNewFiles() {
 			s.lock[file.Name()] = FileLock{Status: NotRead, ReadLinesNumber: 0}
 			s.filesQueue = append(s.filesQueue, file.Name())
 			fmt.Printf("Added new file %s to the queue with status 'not_read'\n", file.Name())
+			s.newFilesEvent <- file.Name() // Notify event of new file
 		}
 	}
 }
@@ -200,41 +228,65 @@ func (w *Worker) readFile() {
 	reader := csv.NewReader(file)
 	var results []map[string]string
 	readLines := w.service.lock[w.file].ReadLinesNumber
+	tempReadLines := readLines
 
 	for {
 		record, err := reader.Read()
 		if err != nil {
+			// End of file or error
 			break
 		}
 
+		// Skip empty lines (check if all columns in the record are empty)
+		if isEmptyLine(record) {
+			continue
+		}
+
+		// If there are remaining lines to skip, decrement the counter
 		if readLines > 0 {
 			readLines--
 			continue
 		}
 
+		// Process the record if it's not empty and within the chunk limit
 		if len(results) < MAX_CHUNK_SIZE {
 			results = append(results, map[string]string{"id": record[0], "name": record[1]})
+			tempReadLines++
 		} else {
 			break
 		}
 	}
 
+	// Append processed data to result file
 	w.appendToResultFile(results)
 
+	// Update the file status based on the processing outcome
 	if len(results) < MAX_CHUNK_SIZE {
-		w.service.setFileStatus(w.file, Completed, readLines+len(results))
+		w.service.setFileStatus(w.file, Completed, tempReadLines)
 		fmt.Printf("File %s has been completed.\n", w.file)
 	} else {
-		w.service.setFileStatus(w.file, NotRead, readLines+len(results))
+		w.service.setFileStatus(w.file, NotRead, tempReadLines)
 		fmt.Printf("File %s is set to 'not_read' for further processing.\n", w.file)
 	}
 
+	// Decrease the worker count once done
 	w.service.activeWorkers--
+}
+
+// isEmptyLine checks if the CSV record is empty.
+func isEmptyLine(record []string) bool {
+	// Check if all columns are empty (empty strings or no values)
+	for _, field := range record {
+		if field != "" {
+			return false // Found a non-empty field, return false
+		}
+	}
+	return true // All fields are empty
 }
 
 // appendToResultFile appends the processed data to the result file.
 func (w *Worker) appendToResultFile(chunk []map[string]string) {
-	file, err := os.OpenFile(RESULT_FILE_PATH, os.O_APPEND|os.O_WRONLY, os.ModePerm)
+	file, err := os.OpenFile(RESULT_FILE_PATH, os.O_APPEND|os.O_WRONLY|os.O_CREATE, os.ModePerm)
 	if err != nil {
 		fmt.Printf("Error opening result file: %v\n", err)
 		return
