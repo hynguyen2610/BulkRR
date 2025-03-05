@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Launch Program",
+        "type": "go",
+        "request": "launch",
+        "mode": "auto",
+        "program": "${workspaceFolder}/server-go/main.go",
+        "env": {},
+        "args": []
+      }
+    ]
+  }
+  
